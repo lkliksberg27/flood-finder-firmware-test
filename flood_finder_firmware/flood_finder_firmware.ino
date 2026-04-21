@@ -5,6 +5,7 @@
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_BMP3XX.h>
 #include <TinyGPSPlus.h>
+#include <LoRa.h>
 #include "secrets.h"
 
 // === PIN DEFINITIONS ===
@@ -23,6 +24,16 @@
 #define GPS_TX    45
 #define MPU6050_ADDR 0x68
 
+// Heltec V4 LoRa SX1262 pins
+#define LORA_SS    8
+#define LORA_RST   12
+#define LORA_DIO1  14
+#define LORA_BUSY  13
+#define LORA_FREQ  915E6
+#define LORA_BW    125E3
+#define LORA_SF    7
+#define LORA_TX_POWER 14
+
 // === OBJECTS ===
 Adafruit_SSD1306 display(128, 64, &Wire1, -1);
 Adafruit_BMP3XX bmp;
@@ -33,11 +44,14 @@ HardwareSerial GPSSerial(1);
 volatile int encoderPos = 0;
 int lastEncPos = 0;
 int currentPage = 0;
-const int PAGES = 5;
-bool bmpOK = false, mpuOK = false, wifiConnected = false;
+const int PAGES = 6;
+bool bmpOK = false, mpuOK = false, wifiConnected = false, loraOK = false;
 bool transmitting = false;
+bool isCharging = false;
+int txMode = 0;  // 0 = WiFi, 1 = LoRa
 unsigned long lastSend = 0;
 unsigned long lastBtn = 0;
+unsigned long btnHoldStart = 0;
 const unsigned long SEND_INTERVAL = 30000;
 
 // Sensor data
@@ -47,7 +61,6 @@ double gpsLat = 0, gpsLng = 0;
 int gpsSats = 0;
 float battVoltage;
 int battPercent;
-int wifiRSSI = 0;
 
 // === ENCODER ISR ===
 void IRAM_ATTR encoderISR() {
@@ -102,8 +115,19 @@ void setup() {
   Wire.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)1);
   mpuOK = Wire.available() && (Wire.read() == 0x68);
 
+  // LoRa
+  showMsg("Init LoRa...", "915 MHz");
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO1);
+  loraOK = LoRa.begin(LORA_FREQ);
+  if (loraOK) {
+    LoRa.setSpreadingFactor(LORA_SF);
+    LoRa.setSignalBandwidth(LORA_BW);
+    LoRa.setTxPower(LORA_TX_POWER);
+  }
+
   showMsg("BMP:" + String(bmpOK?"OK":"FAIL"),
-          "MPU:" + String(mpuOK?"OK":"FAIL"));
+          "MPU:" + String(mpuOK?"OK":"FAIL") +
+          " LoRa:" + String(loraOK?"OK":"FAIL"));
   delay(1500);
 
   // WiFi
@@ -115,10 +139,9 @@ void setup() {
   }
   wifiConnected = (WiFi.status() == WL_CONNECTED);
   if (wifiConnected) {
-    wifiRSSI = WiFi.RSSI();
     showMsg("WiFi Connected!", WiFi.localIP().toString());
   } else {
-    showMsg("WiFi FAILED", "Running offline");
+    showMsg("WiFi FAILED", "LoRa mode available");
   }
   delay(1500);
 }
@@ -139,23 +162,25 @@ void loop() {
     case 0: pageSensors(); break;
     case 1: pageGPS(); break;
     case 2: pageSystem(); break;
-    case 3: pageWifi(); break;
-    case 4: pageTransmit(); break;
+    case 3: pageMode(); break;
+    case 4: pageWifi(); break;
+    case 5: pageTransmit(); break;
   }
 
-  // Page dots at bottom
+  // Page dots
   display.setCursor(0, 57);
   display.print("[");
   for (int i = 0; i < PAGES; i++)
     display.print(i == currentPage ? "*" : "-");
   display.print("] ");
-  const char* n[] = {"SENS","GPS","SYS","WIFI","TX"};
+  const char* n[] = {"SENS","GPS","SYS","MODE","WIFI","TX"};
   display.print(n[currentPage]);
   display.display();
 
-  // Auto-send if transmitting
-  if (transmitting && wifiConnected && millis() - lastSend > SEND_INTERVAL) {
-    sendToSupabase();
+  // Auto-send
+  if (transmitting && millis() - lastSend > SEND_INTERVAL) {
+    if (txMode == 0 && wifiConnected) sendToSupabase();
+    else if (txMode == 1 && loraOK) sendViaLoRa();
     lastSend = millis();
   }
 
@@ -202,6 +227,7 @@ void readBattery() {
   analogSetAttenuation(ADC_11db);
   battVoltage = analogRead(VBAT_PIN) / 4095.0 * 3.3 * 2.0;
   battPercent = constrain((int)((battVoltage - 3.0) / 1.2 * 100), 0, 100);
+  isCharging = (battVoltage > 4.5);
 }
 
 // === ENCODER ===
@@ -248,10 +274,37 @@ void pageSystem() {
   display.println("=== SYSTEM ===");
   display.print("Bat: "); display.print(battVoltage, 2);
   display.print("V "); display.print(battPercent); display.println("%");
-  display.print("USB: "); display.println(battVoltage > 4.5 ? "Charging" : "No");
-  display.print("BMP: "); display.println(bmpOK ? "OK" : "ERR");
-  display.print("MPU: "); display.println(mpuOK ? "OK" : "ERR");
-  display.print("WiFi: "); display.println(wifiConnected ? "Yes" : "No");
+  display.print("Chrg: "); display.println(isCharging ? "YES (USB)" : "No");
+  display.print("BMP: "); display.print(bmpOK ? "OK" : "ERR");
+  display.print(" MPU: "); display.println(mpuOK ? "OK" : "ERR");
+  display.print("LoRa: "); display.print(loraOK ? "OK" : "ERR");
+  display.print(" WiFi: "); display.println(wifiConnected ? "OK" : "ERR");
+}
+
+void pageMode() {
+  bool btn = buttonPressed();
+  display.println("=== TX MODE ===");
+  display.println();
+
+  if (btn) {
+    txMode = (txMode + 1) % 2;
+  }
+
+  if (txMode == 0) {
+    display.println("  > WiFi Direct");
+    display.println("    LoRa -> Cellular");
+    display.println();
+    display.print("  WiFi: ");
+    display.println(wifiConnected ? "Connected" : "No connection");
+  } else {
+    display.println("    WiFi Direct");
+    display.println("  > LoRa -> Cellular");
+    display.println();
+    display.print("  LoRa: ");
+    display.println(loraOK ? "Ready 915MHz" : "Not available");
+  }
+  display.println();
+  display.println("  Press to switch");
 }
 
 void pageWifi() {
@@ -281,10 +334,11 @@ void pageTransmit() {
   display.println();
   if (transmitting) {
     display.println("  STATUS: ACTIVE");
-    display.println("  Sending every 30s");
+    display.print("  Via: ");
+    display.println(txMode == 0 ? "WiFi" : "LoRa");
+    display.println("  Every 30 seconds");
     display.print("  Last: ");
     display.print((millis()-lastSend)/1000); display.println("s ago");
-    display.println();
     display.println("  Press to STOP");
   } else {
     display.println("  STATUS: STOPPED");
@@ -294,7 +348,7 @@ void pageTransmit() {
   }
 }
 
-// === SUPABASE POST ===
+// === SEND VIA WIFI (Supabase POST) ===
 void sendToSupabase() {
   if (!wifiConnected) return;
 
@@ -319,13 +373,41 @@ void sendToSupabase() {
   json += "\"battery_voltage\":" + String(battVoltage, 2) + ",";
   json += "\"battery_percent\":" + String(battPercent) + ",";
   json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
-  json += "\"encoder_pos\":" + String(encoderPos);
+  json += "\"encoder_pos\":" + String(encoderPos) + ",";
+  json += "\"is_charging\":" + String(isCharging ? "true" : "false") + ",";
+  json += "\"tx_mode\":\"wifi\"";
   json += "}";
 
   int code = http.POST(json);
   Serial.print("Supabase POST: ");
   Serial.println(code);
   http.end();
+}
+
+// === SEND VIA LORA ===
+void sendViaLoRa() {
+  if (!loraOK) return;
+
+  // Pack sensor data into a compact LoRa packet
+  // Gateway receives this and forwards to Supabase via cellular
+  String pkt = "FF|";  // Flood Finder header
+  pkt += String(temperature, 2) + "|";
+  pkt += String(pressure, 2) + "|";
+  pkt += String(distance, 1) + "|";
+  pkt += String(tiltAngle, 1) + "|";
+  pkt += String(gpsLat, 6) + "|";
+  pkt += String(gpsLng, 6) + "|";
+  pkt += String(battVoltage, 2) + "|";
+  pkt += String(battPercent) + "|";
+  pkt += String(isCharging ? 1 : 0) + "|";
+  pkt += String(encoderPos);
+
+  LoRa.beginPacket();
+  LoRa.print(pkt);
+  LoRa.endPacket();
+
+  Serial.print("LoRa TX: ");
+  Serial.println(pkt);
 }
 
 // === HELPERS ===
