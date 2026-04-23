@@ -9,8 +9,8 @@
 #include "secrets.h"
 
 // === PIN DEFINITIONS ===
-#define EXT_SDA   33
-#define EXT_SCL   34
+#define EXT_SDA   47
+#define EXT_SCL   48
 #define OLED_SDA  17
 #define OLED_SCL  18
 #define OLED_RST  21
@@ -20,8 +20,11 @@
 #define ENC_DT    6
 #define ENC_SW    7
 #define VBAT_PIN  1
-#define GPS_RX    46
-#define GPS_TX    45
+#define ADC_CTRL  37
+#define VEXT_PIN  36
+#define GPS_EN    34
+#define GPS_RX    39
+#define GPS_TX    38
 #define MPU6050_ADDR 0x68
 
 // Heltec V4 LoRa SX1262 pins
@@ -83,6 +86,14 @@ void setup() {
 
   // Sensor I2C
   Wire.begin(EXT_SDA, EXT_SCL);
+
+  // Vext + GPS power control (V4 board internal)
+  pinMode(VEXT_PIN, OUTPUT);
+  digitalWrite(VEXT_PIN, LOW);   // enable GPS/peripherals
+  pinMode(GPS_EN, OUTPUT);
+  digitalWrite(GPS_EN, LOW);     // enable L76K
+  pinMode(ADC_CTRL, OUTPUT);
+  digitalWrite(ADC_CTRL, HIGH);  // enable battery voltage divider
 
   // GPS
   GPSSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
