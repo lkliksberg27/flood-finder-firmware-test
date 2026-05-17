@@ -95,6 +95,13 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
+  // Release deep-sleep pin holds set in goToDeepSleep() so we can drive
+  // VEXT / GPS_EN / ADC_CTRL again on this fresh boot.
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis((gpio_num_t)VEXT_PIN);
+  gpio_hold_dis((gpio_num_t)GPS_EN);
+  gpio_hold_dis((gpio_num_t)ADC_CTRL);
+
   // Wake-cause routing:
   //   EXT0 (encoder press) -> force AWAKE, land on SENS page
   //   TIMER (from SEMI sleep) -> resume SEMI page, take one reading, sleep again
@@ -547,19 +554,49 @@ void pageSleep() {
 
 // secs > 0: wake on timer OR encoder press. secs == 0: only encoder press wakes.
 void goToDeepSleep(int secs) {
+  // 1. OLED off — sends a command to the SSD1306 to enter its own sleep mode (~2µA)
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
   display.clearDisplay();
   display.display();
+
+  // 2. Radios off
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
+  btStop();
   LoRa.end();
 
+  // 3. Power rails off (these only work if peripherals are on Vext, not direct 3.3V).
+  //    VEXT_PIN HIGH = Vext rail off.  GPS_EN HIGH = L76 GPS off.  ADC_CTRL LOW = batt divider off.
+  digitalWrite(VEXT_PIN, HIGH);
+  digitalWrite(GPS_EN,   HIGH);
+  digitalWrite(ADC_CTRL, LOW);
+
+  // 4. Release the I2C buses so the SDA/SCL pull-ups stop sourcing current.
+  Wire.end();
+  Wire1.end();
+
+  // 5. Make every active GPIO an input with no pull, so nothing leaks.
+  pinMode(EXT_SDA, INPUT);  pinMode(EXT_SCL, INPUT);
+  pinMode(OLED_SDA, INPUT); pinMode(OLED_SCL, INPUT);
+  pinMode(TRIG_PIN, INPUT);  // ultrasonic stops pinging
+  pinMode(GPS_RX, INPUT);    pinMode(GPS_TX, INPUT);
+  pinMode(LORA_SS, INPUT);   pinMode(LORA_RST, INPUT);
+  pinMode(LORA_DIO1, INPUT); pinMode(LORA_BUSY, INPUT);
+
+  // 6. Hold pin states through deep sleep (ESP32-S3 otherwise floats GPIOs).
+  gpio_hold_en((gpio_num_t)VEXT_PIN);
+  gpio_hold_en((gpio_num_t)GPS_EN);
+  gpio_hold_en((gpio_num_t)ADC_CTRL);
+  gpio_deep_sleep_hold_en();
+
+  // 7. Configure wake source: encoder press (RTC_GPIO 7 LOW)
   rtc_gpio_pullup_en((gpio_num_t)ENC_SW);
   rtc_gpio_pulldown_dis((gpio_num_t)ENC_SW);
   esp_sleep_enable_ext0_wakeup((gpio_num_t)ENC_SW, 0);
-
   if (secs > 0) {
     esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
   }
+
   esp_deep_sleep_start();
 }
 
