@@ -287,10 +287,15 @@ void readGPS() {
 }
 
 void readBattery() {
-  analogReadResolution(12);
+  // Heltec V4 has a 100/(100+390) = 0.204 resistor divider on VBAT, gated by
+  // ADC_CTRL (GPIO 37). ADC_CTRL is pulled HIGH in setup() so the divider is live.
+  // V_battery = V_adc * (100 + 390) / 100 = V_adc * 4.9
+  // analogReadMilliVolts() uses the ESP32-S3's factory ADC calibration -> much
+  // more accurate than analogRead() + manual math.
   analogSetAttenuation(ADC_11db);
-  battVoltage = analogRead(VBAT_PIN) / 4095.0 * 3.3 * 2.0;
-  battPercent = constrain((int)((battVoltage - 3.0) / 1.2 * 100), 0, 100);
+  uint32_t v_adc_mV = analogReadMilliVolts(VBAT_PIN);
+  battVoltage = (v_adc_mV / 1000.0) * 4.9;
+  battPercent = constrain((int)((battVoltage - 3.0) / (4.2 - 3.0) * 100), 0, 100);
   isCharging = (battVoltage > 4.5);
 }
 
