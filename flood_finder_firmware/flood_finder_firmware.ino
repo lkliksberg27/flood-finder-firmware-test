@@ -63,7 +63,7 @@ const unsigned long SEND_INTERVAL = 30000;
 // Sleep state persists across deep sleep
 RTC_DATA_ATTR int rtcSleepPage = -1;
 const unsigned long SEMI_SLEEP_SEC = 600;     // 10 min between SEMI reads
-const unsigned long MODE_ENTER_DELAY = 2000;  // 2s grace before sleep activates
+const unsigned long MODE_ENTER_DELAY = 5000;  // 5s grace before sleep activates (was 2s — felt too snappy)
 unsigned long pageEnterMs = 0;
 
 float temperature, pressure, distance, tiltAngle;
@@ -233,7 +233,7 @@ void loop() {
     lastSend = millis();
   }
 
-  delay(150);
+  delay(30);  // was 150ms — much snappier encoder response
 }
 
 // === SENSOR READS ===
@@ -285,7 +285,10 @@ void handleEncoder() {
   if (encoderPos != lastEncPos) {
     int diff = encoderPos - lastEncPos;
     int prevPage = currentPage;
-    currentPage = (currentPage + diff + PAGES) % PAGES;
+    // Robust modulo for any positive/negative diff (handles multi-wrap)
+    int next = (currentPage + diff) % PAGES;
+    if (next < 0) next += PAGES;
+    currentPage = next;
     if (currentPage != prevPage) pageEnterMs = millis();
     lastEncPos = encoderPos;
   }
