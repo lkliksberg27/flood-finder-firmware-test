@@ -6,6 +6,8 @@
 #include <Adafruit_BMP3XX.h>
 #include <TinyGPSPlus.h>
 #include <LoRa.h>
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
 #include "secrets.h"
 
 // === PIN DEFINITIONS ===
@@ -47,15 +49,30 @@ HardwareSerial GPSSerial(1);
 volatile int encoderPos = 0;
 int lastEncPos = 0;
 int currentPage = 0;
-const int PAGES = 6;
+// Pages 0..5 = original. Pages 6,7,8 = AWAKE / SEMI / SLEEP power mode pages.
+// Rotating onto a mode page activates that mode; rotating off goes back to normal.
+const int PAGES = 9;
 bool bmpOK = false, mpuOK = false, wifiConnected = false, loraOK = false;
 bool transmitting = false;
 bool isCharging = false;
 int txMode = 0;  // 0 = WiFi, 1 = LoRa
 unsigned long lastSend = 0;
+unsigned long lastRead = 0;
 unsigned long lastBtn = 0;
 unsigned long btnHoldStart = 0;
-const unsigned long SEND_INTERVAL = 30000;
+const unsigned long SEND_INTERVAL = 10000;   // 10s (was 30s)
+const unsigned long READ_INTERVAL = 10000;   // 10s reads in AWAKE mode
+
+// === POWER MODES (persist through deep sleep) ===
+// Boot count + last-landed page persist through deep sleep so a wake from
+// SEMI-sleep returns the user to the SEMI page they were on, not page 0.
+RTC_DATA_ATTR int bootCount = 0;
+RTC_DATA_ATTR int rtcSleepPage = -1;        // Which page we slept from; -1 = wasn't sleeping
+const unsigned long SEMI_SLEEP_SEC = 600;    // 10 min between semi-sleep reads
+const unsigned long MODE_ENTER_DELAY = 2000; // 2 s grace period after landing on a sleep page
+
+// Tracks when user landed on the current page (for sleep-grace timing)
+unsigned long pageEnterMs = 0;
 
 // Sensor data
 float temperature, pressure, distance, tiltAngle;
@@ -75,6 +92,19 @@ void IRAM_ATTR encoderISR() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  bootCount++;
+
+  // Check why we woke up. If encoder button (EXT0) -> force AWAKE (page 0 SENS).
+  // If timer (SEMI-sleep) -> stay on the SEMI page so the cycle continues.
+  esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
+  if (wake == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("[WAKE] Encoder button -> AWAKE page");
+    currentPage = 0;
+    rtcSleepPage = -1;
+  } else if (wake == ESP_SLEEP_WAKEUP_TIMER) {
+    Serial.println("[WAKE] Timer -> resume SEMI page");
+    currentPage = (rtcSleepPage >= 0) ? rtcSleepPage : 7;
+  }
 
   // OLED
   pinMode(OLED_RST, OUTPUT);
@@ -82,7 +112,13 @@ void setup() {
   digitalWrite(OLED_RST, HIGH); delay(50);
   Wire1.begin(OLED_SDA, OLED_SCL);
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  showMsg("FLOOD FINDER v2", "Booting...");
+  if (wake == ESP_SLEEP_WAKEUP_TIMER) {
+    showMsg("Semi-sleep wake", "Reading sensors...");
+  } else if (wake == ESP_SLEEP_WAKEUP_EXT0) {
+    showMsg("WOKE UP", "Mode: AWAKE");
+  } else {
+    showMsg("FLOOD FINDER v2", "Booting...");
+  }
 
   // Sensor I2C
   Wire.begin(EXT_SDA, EXT_SCL);
@@ -155,13 +191,51 @@ void setup() {
     showMsg("WiFi FAILED", "LoRa mode available");
   }
   delay(1500);
+
+  // If we woke from the SEMI-sleep timer, do one reading + send and go back to sleep.
+  // (loop() never runs in this path.)
+  if (wake == ESP_SLEEP_WAKEUP_TIMER) {
+    readSensors();
+    readGPS();
+    readBattery();
+    if (txMode == 0 && wifiConnected) sendToSupabase();
+    else if (txMode == 1 && loraOK) sendViaLoRa();
+    showMsg("Semi-sleep", "Back to sleep...");
+    delay(800);
+    rtcSleepPage = 7;  // SEMI page
+    goToDeepSleep(SEMI_SLEEP_SEC);
+  }
+  pageEnterMs = millis();
 }
 
 // === MAIN LOOP ===
 void loop() {
-  readSensors();
-  readGPS();
-  readBattery();
+  // SEMI page (7): after 2 s grace (so user can rotate past without sleeping),
+  // take one reading + send, then deep sleep 10 min. Timer wake comes back here.
+  if (currentPage == 7 && millis() - pageEnterMs > MODE_ENTER_DELAY) {
+    readSensors(); readGPS(); readBattery();
+    if (txMode == 0 && wifiConnected) sendToSupabase();
+    else if (txMode == 1 && loraOK) sendViaLoRa();
+    showMsg("SEMI SLEEP", "Sleep 10 min...");
+    delay(1500);
+    rtcSleepPage = 7;
+    goToDeepSleep(SEMI_SLEEP_SEC);
+  }
+  // SLEEP page (8): after 2 s grace, full deep sleep, only knob press wakes.
+  if (currentPage == 8 && millis() - pageEnterMs > MODE_ENTER_DELAY) {
+    showMsg("FULL SLEEP", "Press knob to wake");
+    delay(1500);
+    rtcSleepPage = 8;
+    goToDeepSleep(0);
+  }
+
+  // AWAKE: throttle sensor reads to once every READ_INTERVAL (10s)
+  if (millis() - lastRead > READ_INTERVAL || lastRead == 0) {
+    readSensors();
+    readGPS();
+    readBattery();
+    lastRead = millis();
+  }
   handleEncoder();
 
   display.clearDisplay();
@@ -176,6 +250,9 @@ void loop() {
     case 3: pageMode(); break;
     case 4: pageWifi(); break;
     case 5: pageTransmit(); break;
+    case 6: pageAwake(); break;
+    case 7: pageSemi(); break;
+    case 8: pageSleep(); break;
   }
 
   // Page dots
@@ -184,7 +261,7 @@ void loop() {
   for (int i = 0; i < PAGES; i++)
     display.print(i == currentPage ? "*" : "-");
   display.print("] ");
-  const char* n[] = {"SENS","GPS","SYS","MODE","WIFI","TX"};
+  const char* n[] = {"SENS","GPS","SYS","MODE","WIFI","TX","AWAKE","SEMI","SLEEP"};
   display.print(n[currentPage]);
   display.display();
 
@@ -242,10 +319,14 @@ void readBattery() {
 }
 
 // === ENCODER ===
+// Rotation = navigate pages. Same simple behavior as the original sketch.
+// Press handling (wake from sleep) is at the OS level via EXT0 wakeup.
 void handleEncoder() {
   if (encoderPos != lastEncPos) {
     int diff = encoderPos - lastEncPos;
+    int prevPage = currentPage;
     currentPage = (currentPage + diff + PAGES) % PAGES;
+    if (currentPage != prevPage) pageEnterMs = millis();
     lastEncPos = encoderPos;
   }
 }
@@ -285,11 +366,13 @@ void pageSystem() {
   display.println("=== SYSTEM ===");
   display.print("Bat: "); display.print(battVoltage, 2);
   display.print("V "); display.print(battPercent); display.println("%");
-  display.print("Chrg: "); display.println(isCharging ? "YES (USB)" : "No");
   display.print("BMP: "); display.print(bmpOK ? "OK" : "ERR");
   display.print(" MPU: "); display.println(mpuOK ? "OK" : "ERR");
   display.print("LoRa: "); display.print(loraOK ? "OK" : "ERR");
   display.print(" WiFi: "); display.println(wifiConnected ? "OK" : "ERR");
+  const char* pgName[] = {"SENS","GPS","SYS","MODE","WIFI","TX","AWAKE","SEMI","SLEEP"};
+  display.print("Pg: "); display.print(pgName[currentPage]);
+  display.print(" Boot:"); display.println(bootCount);
 }
 
 void pageMode() {
@@ -419,6 +502,73 @@ void sendViaLoRa() {
 
   Serial.print("LoRa TX: ");
   Serial.println(pkt);
+}
+
+// === POWER MODE PAGES ===
+// Three dedicated pages — rotating onto a sleep page activates that mode.
+// AWAKE page: normal sensor view, screen on, 10s read interval (default behavior).
+// SEMI page : 2s grace then sleeps 10min, wakes on timer, reads + sends, sleeps again.
+// SLEEP page: 2s grace then full deep sleep, only knob press wakes.
+// Press knob from ANY sleep state -> wake to SENS page (page 0).
+void pageAwake() {
+  display.println("=== AWAKE MODE ===");
+  display.println();
+  display.println("  Always on");
+  display.println("  Reads every 10s");
+  display.println("  Screen stays on");
+  display.println();
+  display.println("(turn to leave)");
+}
+
+void pageSemi() {
+  display.println("=== SEMI SLEEP ===");
+  display.println();
+  display.println("  Sleeps 10 min");
+  display.println("  Wakes for 1 reading");
+  display.println("  Sends + sleeps again");
+  int rem = (MODE_ENTER_DELAY - (millis() - pageEnterMs) + 999) / 1000;
+  if (rem < 0) rem = 0;
+  display.print("Entering in ");
+  display.print(rem);
+  display.println("s...");
+}
+
+void pageSleep() {
+  display.println("=== FULL SLEEP ===");
+  display.println();
+  display.println("  Everything OFF");
+  display.println("  Press knob to wake");
+  display.println();
+  int rem = (MODE_ENTER_DELAY - (millis() - pageEnterMs) + 999) / 1000;
+  if (rem < 0) rem = 0;
+  display.print("Entering in ");
+  display.print(rem);
+  display.println("s...");
+}
+
+// === DEEP SLEEP HELPER ===
+// secs > 0: wake on timer OR encoder press. secs == 0: only encoder press wakes.
+void goToDeepSleep(int secs) {
+  Serial.printf("[SLEEP] entering deep sleep for %d sec (button wake = AWAKE)\n", secs);
+  Serial.flush();
+
+  // Shut everything down to minimize current draw
+  display.clearDisplay();
+  display.display();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  LoRa.end();
+
+  // Configure encoder switch (GPIO 7) as wakeup source — wake when pulled LOW
+  rtc_gpio_pullup_en((gpio_num_t)ENC_SW);
+  rtc_gpio_pulldown_dis((gpio_num_t)ENC_SW);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)ENC_SW, 0);
+
+  if (secs > 0) {
+    esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
+  }
+
+  esp_deep_sleep_start();
 }
 
 // === HELPERS ===
