@@ -327,14 +327,15 @@ void takeAveragedReadings() {
   sortF(tArr, N); sortF(pArr, N); sortF(dArr, N); sortF(aArr, N);
   sortI(axArr, N); sortI(ayArr, N); sortI(azArr, N);
 
-  // Of the middle KEEP samples: if fewer than 6 are exactly zero, those zeros
-  // are glitches (especially common on the JSN-SR04T ultrasonic) — drop them
-  // and average the rest. If 6+ are zero, the sensor really is reading zero,
-  // so include them in the average.
+  // Of the middle KEEP samples:
+  //   - 6+ zeros  -> sensor really is reading zero, send 0 (don't dilute with averaging)
+  //   - 1..5 zeros -> glitches (typical JSN-SR04T), drop them and average the rest
+  //   - 0 zeros   -> normal trimmed mean
   auto zeroTrimF = [](float* a, int n) -> float {
     int zeros = 0;
     for (int i = 0; i < n; i++) if (a[i] == 0.0f) zeros++;
-    if (zeros > 0 && zeros < 6 && zeros < n) {
+    if (zeros >= 6) return 0.0f;
+    if (zeros > 0) {
       float s = 0;
       for (int i = 0; i < n; i++) if (a[i] != 0.0f) s += a[i];
       return s / (n - zeros);
@@ -346,7 +347,8 @@ void takeAveragedReadings() {
   auto zeroTrimI = [](int32_t* a, int n) -> int32_t {
     int zeros = 0;
     for (int i = 0; i < n; i++) if (a[i] == 0) zeros++;
-    if (zeros > 0 && zeros < 6 && zeros < n) {
+    if (zeros >= 6) return 0;
+    if (zeros > 0) {
       int32_t s = 0;
       for (int i = 0; i < n; i++) if (a[i] != 0) s += a[i];
       return s / (n - zeros);
