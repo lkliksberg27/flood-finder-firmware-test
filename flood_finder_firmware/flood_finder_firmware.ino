@@ -73,7 +73,13 @@ int gpsSats = 0;
 float battVoltage;
 int battPercent;
 
+volatile unsigned long lastEncTickMs = 0;
+const unsigned long ENC_DEBOUNCE_MS = 5;
+
 void IRAM_ATTR encoderISR() {
+  unsigned long now = millis();
+  if (now - lastEncTickMs < ENC_DEBOUNCE_MS) return;  // bounce filter
+  lastEncTickMs = now;
   if (digitalRead(ENC_DT) == digitalRead(ENC_CLK)) encoderPos++;
   else encoderPos--;
 }
@@ -284,13 +290,16 @@ void readBattery() {
 void handleEncoder() {
   if (encoderPos != lastEncPos) {
     int diff = encoderPos - lastEncPos;
+    // One click of the knob = one page change. Encoders often emit several
+    // pulses per detent, so we always move exactly ±1 page per loop iter and
+    // dequeue just one tick. Leftover ticks process on the next loop.
+    int step = (diff > 0) ? 1 : -1;
     int prevPage = currentPage;
-    // Robust modulo for any positive/negative diff (handles multi-wrap)
-    int next = (currentPage + diff) % PAGES;
+    int next = (currentPage + step) % PAGES;
     if (next < 0) next += PAGES;
     currentPage = next;
     if (currentPage != prevPage) pageEnterMs = millis();
-    lastEncPos = encoderPos;
+    lastEncPos += step;
   }
 }
 
