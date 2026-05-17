@@ -51,7 +51,7 @@ WiFiManager wifiManager;
 volatile int encoderPos = 0;
 int lastEncPos = 0;
 int currentPage = 0;
-const int PAGES = 9;  // 0..5 original + 6=AWAKE, 7=SEMI, 8=SLEEP
+const int PAGES = 10;  // 0..5 original + 6=BASE + 7=AWAKE, 8=SEMI, 9=SLEEP  // 0..5 original + 6=AWAKE, 7=SEMI, 8=SLEEP
 bool bmpOK = false, mpuOK = false, wifiConnected = false, loraOK = false;
 bool transmitting = false;
 bool isCharging = false;
@@ -62,9 +62,16 @@ const unsigned long SEND_INTERVAL = 30000;
 
 // Sleep state persists across deep sleep
 RTC_DATA_ATTR int rtcSleepPage = -1;
-const unsigned long SEMI_SLEEP_SEC = 600;     // 10 min between SEMI reads
-const unsigned long MODE_ENTER_DELAY = 5000;  // 5s grace before sleep activates (was 2s — felt too snappy)
-unsigned long pageEnterMs = 0;
+const unsigned long SEMI_SLEEP_SEC = 600;
+
+// Baseline values (set by user from BASE page, survive deep sleep)
+RTC_DATA_ATTR bool   baselineSet = false;
+RTC_DATA_ATTR float  baseAlt = 0;       // baro altitude (m)
+RTC_DATA_ATTR float  baseTilt = 0;      // degrees
+RTC_DATA_ATTR float  baseDist = 0;      // cm
+RTC_DATA_ATTR double baseLat = 0;
+RTC_DATA_ATTR double baseLng = 0;
+RTC_DATA_ATTR float  basePressure = 0;
 
 float temperature, pressure, distance, tiltAngle;
 int16_t ax, ay, az;
@@ -96,7 +103,7 @@ void setup() {
     currentPage = 0;
     rtcSleepPage = -1;
   } else if (wake == ESP_SLEEP_WAKEUP_TIMER) {
-    currentPage = (rtcSleepPage >= 0) ? rtcSleepPage : 7;
+    currentPage = (rtcSleepPage >= 0) ? rtcSleepPage : 8;
   }
 
   // OLED — full brightness
@@ -177,10 +184,9 @@ void setup() {
     else if (txMode == 1 && loraOK) sendViaLoRa();
     showMsg("Semi-sleep", "Back to sleep...");
     delay(800);
-    rtcSleepPage = 7;
+    rtcSleepPage = 8;
     goToDeepSleep(SEMI_SLEEP_SEC);
   }
-  pageEnterMs = millis();
 }
 
 void loop() {
@@ -201,9 +207,10 @@ void loop() {
     case 3: pageMode(); break;
     case 4: pageWifi(); break;
     case 5: pageTransmit(); break;
-    case 6: pageAwake(); break;
-    case 7: pageSemi(); break;
-    case 8: pageSleep(); break;
+    case 6: pageBaseline(); break;
+    case 7: pageAwake(); break;
+    case 8: pageSemi(); break;
+    case 9: pageSleep(); break;
   }
 
   display.setCursor(0, 57);
@@ -211,7 +218,7 @@ void loop() {
   for (int i = 0; i < PAGES; i++)
     display.print(i == currentPage ? "*" : "-");
   display.print("] ");
-  const char* n[] = {"SENS","GPS","SYS","MODE","WIFI","TX","AWAKE","SEMI","SLEEP"};
+  const char* n[] = {"SENS","GPS","SYS","MODE","WIFI","TX","BASE","AWAKE","SEMI","SLEEP"};
   display.print(n[currentPage]);
   display.display();
 
@@ -276,11 +283,9 @@ void handleEncoder() {
     // pulses per detent, so we always move exactly ±1 page per loop iter and
     // dequeue just one tick. Leftover ticks process on the next loop.
     int step = (diff > 0) ? 1 : -1;
-    int prevPage = currentPage;
     int next = (currentPage + step) % PAGES;
     if (next < 0) next += PAGES;
     currentPage = next;
-    if (currentPage != prevPage) pageEnterMs = millis();
     lastEncPos += step;
   }
 }
@@ -464,6 +469,40 @@ void sendViaLoRa() {
 // Rotate onto a sleep page -> see the description. Press the encoder to confirm.
 // Nothing happens automatically — you have to press to actually sleep.
 // Pressing the encoder during deep sleep wakes the device back to SENS.
+void pageBaseline() {
+  // Show current vs baseline. Press encoder to capture current as new baseline.
+  float curAlt = (bmpOK && pressure > 0)
+    ? 44330.0 * (1.0 - pow(pressure / 1013.25, 0.1903))
+    : 0;
+
+  display.println("== BASELINE ==");
+  if (baselineSet) {
+    display.print("Alt:");  display.print(curAlt, 1);   display.print("/"); display.println(baseAlt, 1);
+    display.print("Tilt:"); display.print(tiltAngle, 1); display.print("/"); display.println(baseTilt, 1);
+    display.print("Dist:"); display.print(distance, 0); display.print("/"); display.println(baseDist, 0);
+    display.print("GPS:");  display.print(baseLat, 3); display.print(","); display.println(baseLng, 3);
+    display.println("PRESS = RE-SET");
+  } else {
+    display.println("(no baseline yet)");
+    display.print("Alt:");  display.println(curAlt, 1);
+    display.print("Tilt:"); display.println(tiltAngle, 1);
+    display.print("Dist:"); display.println(distance, 0);
+    display.println("PRESS = SET");
+  }
+
+  if (buttonPressed()) {
+    baseAlt      = curAlt;
+    baseTilt     = tiltAngle;
+    baseDist     = distance;
+    basePressure = pressure;
+    baseLat      = gpsLat;
+    baseLng      = gpsLng;
+    baselineSet  = true;
+    showMsg("BASELINE SET", "Stored.");
+    delay(800);
+  }
+}
+
 void pageAwake() {
   display.println("=== AWAKE MODE ===");
   display.println();
@@ -486,7 +525,7 @@ void pageSemi() {
     else if (txMode == 1 && loraOK) sendViaLoRa();
     showMsg("SEMI SLEEP", "Sleep 10 min...");
     delay(1200);
-    rtcSleepPage = 7;
+    rtcSleepPage = 8;
     goToDeepSleep(SEMI_SLEEP_SEC);
   }
 }
@@ -501,7 +540,7 @@ void pageSleep() {
   if (buttonPressed()) {
     showMsg("FULL SLEEP", "Press knob to wake");
     delay(1200);
-    rtcSleepPage = 8;
+    rtcSleepPage = 9;
     goToDeepSleep(0);
   }
 }
