@@ -62,7 +62,9 @@ const unsigned long SEND_INTERVAL = 30000;
 
 // Sleep state persists across deep sleep
 RTC_DATA_ATTR int rtcSleepPage = -1;
-const unsigned long SEMI_SLEEP_SEC = 600;  // 10 min between SEMI reads
+const unsigned long SEMI_SLEEP_SEC = 600;     // 10 min between SEMI reads
+const unsigned long MODE_ENTER_DELAY = 2000;  // 2s grace before sleep activates
+unsigned long pageEnterMs = 0;
 
 float temperature, pressure, distance, tiltAngle;
 int16_t ax, ay, az;
@@ -172,9 +174,28 @@ void setup() {
     rtcSleepPage = 7;
     goToDeepSleep(SEMI_SLEEP_SEC);
   }
+  pageEnterMs = millis();
 }
 
 void loop() {
+  // SEMI page (7): 2s grace, then take a reading + send and sleep 10 min.
+  if (currentPage == 7 && millis() - pageEnterMs > MODE_ENTER_DELAY) {
+    readSensors(); readGPS(); readBattery();
+    if (txMode == 0 && wifiConnected) sendToSupabase();
+    else if (txMode == 1 && loraOK) sendViaLoRa();
+    showMsg("SEMI SLEEP", "Sleep 10 min...");
+    delay(1200);
+    rtcSleepPage = 7;
+    goToDeepSleep(SEMI_SLEEP_SEC);
+  }
+  // SLEEP page (8): 2s grace, then full deep sleep. Only knob press wakes.
+  if (currentPage == 8 && millis() - pageEnterMs > MODE_ENTER_DELAY) {
+    showMsg("FULL SLEEP", "Press knob to wake");
+    delay(1200);
+    rtcSleepPage = 8;
+    goToDeepSleep(0);
+  }
+
   readSensors();
   readGPS();
   readBattery();
@@ -263,7 +284,9 @@ void readBattery() {
 void handleEncoder() {
   if (encoderPos != lastEncPos) {
     int diff = encoderPos - lastEncPos;
+    int prevPage = currentPage;
     currentPage = (currentPage + diff + PAGES) % PAGES;
+    if (currentPage != prevPage) pageEnterMs = millis();
     lastEncPos = encoderPos;
   }
 }
@@ -458,32 +481,19 @@ void pageSemi() {
   display.println("  Sleep 10 min");
   display.println("  Wake -> 1 reading");
   display.println("  Send + sleep again");
-  display.println();
-  display.println("  PRESS TO CONFIRM");
-  if (buttonPressed()) {
-    readSensors(); readGPS(); readBattery();
-    if (txMode == 0 && wifiConnected) sendToSupabase();
-    else if (txMode == 1 && loraOK) sendViaLoRa();
-    showMsg("SEMI SLEEP", "Sleep 10 min...");
-    delay(1200);
-    rtcSleepPage = 7;
-    goToDeepSleep(SEMI_SLEEP_SEC);
-  }
+  int rem = (MODE_ENTER_DELAY - (millis() - pageEnterMs) + 999) / 1000;
+  if (rem < 0) rem = 0;
+  display.print("Entering in "); display.print(rem); display.println("s...");
 }
 
 void pageSleep() {
   display.println("=== FULL SLEEP ===");
   display.println("  Everything OFF");
-  display.println("  Only knob wakes");
+  display.println("  Knob wakes you");
   display.println();
-  display.println();
-  display.println("  PRESS TO CONFIRM");
-  if (buttonPressed()) {
-    showMsg("FULL SLEEP", "Press knob to wake");
-    delay(1200);
-    rtcSleepPage = 8;
-    goToDeepSleep(0);
-  }
+  int rem = (MODE_ENTER_DELAY - (millis() - pageEnterMs) + 999) / 1000;
+  if (rem < 0) rem = 0;
+  display.print("Entering in "); display.print(rem); display.println("s...");
 }
 
 // secs > 0: wake on timer OR encoder press. secs == 0: only encoder press wakes.
