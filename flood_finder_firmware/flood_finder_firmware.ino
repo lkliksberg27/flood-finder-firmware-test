@@ -184,24 +184,6 @@ void setup() {
 }
 
 void loop() {
-  // SEMI page (7): 2s grace, then take a reading + send and sleep 10 min.
-  if (currentPage == 7 && millis() - pageEnterMs > MODE_ENTER_DELAY) {
-    readSensors(); readGPS(); readBattery();
-    if (txMode == 0 && wifiConnected) sendToSupabase();
-    else if (txMode == 1 && loraOK) sendViaLoRa();
-    showMsg("SEMI SLEEP", "Sleep 10 min...");
-    delay(1200);
-    rtcSleepPage = 7;
-    goToDeepSleep(SEMI_SLEEP_SEC);
-  }
-  // SLEEP page (8): 2s grace, then full deep sleep. Only knob press wakes.
-  if (currentPage == 8 && millis() - pageEnterMs > MODE_ENTER_DELAY) {
-    showMsg("FULL SLEEP", "Press knob to wake");
-    delay(1200);
-    rtcSleepPage = 8;
-    goToDeepSleep(0);
-  }
-
   readSensors();
   readGPS();
   readBattery();
@@ -323,15 +305,18 @@ void pageSensors() {
 
 void pageGPS() {
   display.println("=== GPS ===");
-  if (gpsLat != 0) {
-    display.print("Lat: "); display.println(gpsLat, 6);
-    display.print("Lng: "); display.println(gpsLng, 6);
+  if (gps.location.isValid()) {
+    display.print("Lat: "); display.println(gpsLat, 5);
+    display.print("Lng: "); display.println(gpsLng, 5);
   } else {
-    display.println("Searching...");
+    display.println("Lat: --");
+    display.println("Lng: --");
   }
-  display.print("Sats: "); display.println(gpsSats);
-  display.print("Age: ");
-  display.print(gps.location.age()); display.println("ms");
+  display.print("Sats:"); display.print(gpsSats);
+  display.print(" HDOP:");
+  if (gps.hdop.isValid()) display.print(gps.hdop.hdop(), 1); else display.print("--");
+  display.println();
+  display.print("Bytes:"); display.println(gps.charsProcessed());
 }
 
 void pageSystem() {
@@ -493,9 +478,17 @@ void pageSemi() {
   display.println("  Sleep 10 min");
   display.println("  Wake -> 1 reading");
   display.println("  Send + sleep again");
-  int rem = (MODE_ENTER_DELAY - (millis() - pageEnterMs) + 999) / 1000;
-  if (rem < 0) rem = 0;
-  display.print("Entering in "); display.print(rem); display.println("s...");
+  display.println();
+  display.println("  PRESS TO CONFIRM");
+  if (buttonPressed()) {
+    readSensors(); readGPS(); readBattery();
+    if (txMode == 0 && wifiConnected) sendToSupabase();
+    else if (txMode == 1 && loraOK) sendViaLoRa();
+    showMsg("SEMI SLEEP", "Sleep 10 min...");
+    delay(1200);
+    rtcSleepPage = 7;
+    goToDeepSleep(SEMI_SLEEP_SEC);
+  }
 }
 
 void pageSleep() {
@@ -503,9 +496,14 @@ void pageSleep() {
   display.println("  Everything OFF");
   display.println("  Knob wakes you");
   display.println();
-  int rem = (MODE_ENTER_DELAY - (millis() - pageEnterMs) + 999) / 1000;
-  if (rem < 0) rem = 0;
-  display.print("Entering in "); display.print(rem); display.println("s...");
+  display.println();
+  display.println("  PRESS TO CONFIRM");
+  if (buttonPressed()) {
+    showMsg("FULL SLEEP", "Press knob to wake");
+    delay(1200);
+    rtcSleepPage = 8;
+    goToDeepSleep(0);
+  }
 }
 
 // secs > 0: wake on timer OR encoder press. secs == 0: only encoder press wakes.
