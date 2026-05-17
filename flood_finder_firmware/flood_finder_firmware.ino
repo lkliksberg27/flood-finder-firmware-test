@@ -1,5 +1,9 @@
+#define SUPABASE_URL  "https://ygoentpdkizwwskagacw.supabase.co"
+#define SUPABASE_KEY  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inlnb2VudHBka2l6d3dza2FnYWN3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY3NDQxMjYsImV4cCI6MjA5MjMyMDEyNn0.kUISJBxYocLYx6FUg3TDWf7Q6fpal-KO7gitvxin43Q"
+
 #include <Wire.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
 #include <HTTPClient.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -8,11 +12,9 @@
 #include <LoRa.h>
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
-#include "secrets.h"
 
-// === PIN DEFINITIONS ===
-#define EXT_SDA   47
-#define EXT_SCL   48
+#define EXT_SDA   33
+#define EXT_SCL   34
 #define OLED_SDA  17
 #define OLED_SCL  18
 #define OLED_RST  21
@@ -22,14 +24,10 @@
 #define ENC_DT    6
 #define ENC_SW    7
 #define VBAT_PIN  1
-#define ADC_CTRL  37
-#define VEXT_PIN  36
-#define GPS_EN    34
-#define GPS_RX    39
-#define GPS_TX    38
+#define GPS_RX    46
+#define GPS_TX    45
 #define MPU6050_ADDR 0x68
 
-// Heltec V4 LoRa SX1262 pins
 #define LORA_SS    8
 #define LORA_RST   12
 #define LORA_DIO1  14
@@ -39,42 +37,36 @@
 #define LORA_SF    7
 #define LORA_TX_POWER 14
 
-// === OBJECTS ===
 Adafruit_SSD1306 display(128, 64, &Wire1, -1);
 Adafruit_BMP3XX bmp;
 TinyGPSPlus gps;
 HardwareSerial GPSSerial(1);
+WiFiManager wifiManager;
 
-// === STATE ===
 volatile int encoderPos = 0;
 int lastEncPos = 0;
 int currentPage = 0;
 // Pages 0..5 = original. Pages 6,7,8 = AWAKE / SEMI / SLEEP power mode pages.
-// Rotating onto a mode page activates that mode; rotating off goes back to normal.
+// Rotation onto a sleep page activates that mode after a 2-second grace.
 const int PAGES = 9;
 bool bmpOK = false, mpuOK = false, wifiConnected = false, loraOK = false;
 bool transmitting = false;
 bool isCharging = false;
-int txMode = 0;  // 0 = WiFi, 1 = LoRa
+int txMode = 0;
 unsigned long lastSend = 0;
 unsigned long lastRead = 0;
 unsigned long lastBtn = 0;
-unsigned long btnHoldStart = 0;
 const unsigned long SEND_INTERVAL = 10000;   // 10s (was 30s)
 const unsigned long READ_INTERVAL = 10000;   // 10s reads in AWAKE mode
 
-// === POWER MODES (persist through deep sleep) ===
-// Boot count + last-landed page persist through deep sleep so a wake from
-// SEMI-sleep returns the user to the SEMI page they were on, not page 0.
+// Power mode state (persisted through deep sleep via RTC memory)
 RTC_DATA_ATTR int bootCount = 0;
-RTC_DATA_ATTR int rtcSleepPage = -1;        // Which page we slept from; -1 = wasn't sleeping
-const unsigned long SEMI_SLEEP_SEC = 600;    // 10 min between semi-sleep reads
-const unsigned long MODE_ENTER_DELAY = 2000; // 2 s grace period after landing on a sleep page
+RTC_DATA_ATTR int rtcSleepPage = -1;          // Page we slept from; -1 = wasn't sleeping
+const unsigned long SEMI_SLEEP_SEC = 600;     // 10 min between SEMI-sleep reads
+const unsigned long MODE_ENTER_DELAY = 2000;  // 2s grace before a sleep page actually sleeps
 
-// Tracks when user landed on the current page (for sleep-grace timing)
 unsigned long pageEnterMs = 0;
 
-// Sensor data
 float temperature, pressure, distance, tiltAngle;
 int16_t ax, ay, az;
 double gpsLat = 0, gpsLng = 0;
@@ -82,20 +74,19 @@ int gpsSats = 0;
 float battVoltage;
 int battPercent;
 
-// === ENCODER ISR ===
 void IRAM_ATTR encoderISR() {
   if (digitalRead(ENC_DT) == digitalRead(ENC_CLK)) encoderPos++;
   else encoderPos--;
 }
 
-// === SETUP ===
 void setup() {
   Serial.begin(115200);
   delay(500);
   bootCount++;
 
-  // Check why we woke up. If encoder button (EXT0) -> force AWAKE (page 0 SENS).
-  // If timer (SEMI-sleep) -> stay on the SEMI page so the cycle continues.
+  // Wake-cause routing:
+  //   EXT0 (encoder press) -> force AWAKE, land on SENS page
+  //   TIMER (from SEMI sleep) -> resume SEMI page, take one reading, sleep again
   esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
   if (wake == ESP_SLEEP_WAKEUP_EXT0) {
     Serial.println("[WAKE] Encoder button -> AWAKE page");
@@ -106,7 +97,6 @@ void setup() {
     currentPage = (rtcSleepPage >= 0) ? rtcSleepPage : 7;
   }
 
-  // OLED
   pinMode(OLED_RST, OUTPUT);
   digitalWrite(OLED_RST, LOW); delay(50);
   digitalWrite(OLED_RST, HIGH); delay(50);
@@ -120,21 +110,9 @@ void setup() {
     showMsg("FLOOD FINDER v2", "Booting...");
   }
 
-  // Sensor I2C
   Wire.begin(EXT_SDA, EXT_SCL);
-
-  // Vext + GPS power control (V4 board internal)
-  pinMode(VEXT_PIN, OUTPUT);
-  digitalWrite(VEXT_PIN, LOW);   // enable GPS/peripherals
-  pinMode(GPS_EN, OUTPUT);
-  digitalWrite(GPS_EN, LOW);     // enable L76K
-  pinMode(ADC_CTRL, OUTPUT);
-  digitalWrite(ADC_CTRL, HIGH);  // enable battery voltage divider
-
-  // GPS
   GPSSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
 
-  // Pins
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   pinMode(ENC_CLK, INPUT_PULLUP);
@@ -142,7 +120,6 @@ void setup() {
   pinMode(ENC_SW, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(ENC_CLK), encoderISR, FALLING);
 
-  // BMP390 max precision
   bmpOK = bmp.begin_I2C(0x77, &Wire);
   if (bmpOK) {
     bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_16X);
@@ -151,7 +128,6 @@ void setup() {
     bmp.setOutputDataRate(BMP3_ODR_12_5_HZ);
   }
 
-  // MPU-6050
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(0x6B); Wire.write(0x00);
   Wire.endTransmission();
@@ -162,7 +138,6 @@ void setup() {
   Wire.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)1);
   mpuOK = Wire.available() && (Wire.read() == 0x68);
 
-  // LoRa
   showMsg("Init LoRa...", "915 MHz");
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO1);
   loraOK = LoRa.begin(LORA_FREQ);
@@ -177,19 +152,22 @@ void setup() {
           " LoRa:" + String(loraOK?"OK":"FAIL"));
   delay(1500);
 
-  // WiFi
-  showMsg("Connecting WiFi", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 20) {
-    delay(500); tries++;
-  }
-  wifiConnected = (WiFi.status() == WL_CONNECTED);
-  if (wifiConnected) {
-    showMsg("WiFi Connected!", WiFi.localIP().toString());
-  } else {
-    showMsg("WiFi FAILED", "LoRa mode available");
-  }
+  // WiFiManager — creates "Flood Finder" hotspot if no saved WiFi.
+  // Connect from your phone, captive portal lets you pick a network.
+  showMsg("WiFi Setup", "Connect phone to:");
+  display.println("\"Flood Finder\"");
+  display.println("to configure WiFi");
+  display.display();
+
+  wifiManager.setConfigPortalTimeout(120);
+  wifiManager.setAPCallback([](WiFiManager *mgr) {
+    showMsg("Connect phone to:", "\"Flood Finder\"");
+  });
+
+  wifiConnected = wifiManager.autoConnect("Flood Finder");
+
+  if (wifiConnected) showMsg("WiFi Connected!", WiFi.localIP().toString());
+  else showMsg("WiFi skipped", "LoRa mode available");
   delay(1500);
 
   // If we woke from the SEMI-sleep timer, do one reading + send and go back to sleep.
@@ -202,16 +180,15 @@ void setup() {
     else if (txMode == 1 && loraOK) sendViaLoRa();
     showMsg("Semi-sleep", "Back to sleep...");
     delay(800);
-    rtcSleepPage = 7;  // SEMI page
+    rtcSleepPage = 7;
     goToDeepSleep(SEMI_SLEEP_SEC);
   }
   pageEnterMs = millis();
 }
 
-// === MAIN LOOP ===
 void loop() {
-  // SEMI page (7): after 2 s grace (so user can rotate past without sleeping),
-  // take one reading + send, then deep sleep 10 min. Timer wake comes back here.
+  // SEMI page (7): after 2s grace, take one reading + send, deep sleep 10 min.
+  // Timer wake comes back through setup() to repeat.
   if (currentPage == 7 && millis() - pageEnterMs > MODE_ENTER_DELAY) {
     readSensors(); readGPS(); readBattery();
     if (txMode == 0 && wifiConnected) sendToSupabase();
@@ -221,7 +198,7 @@ void loop() {
     rtcSleepPage = 7;
     goToDeepSleep(SEMI_SLEEP_SEC);
   }
-  // SLEEP page (8): after 2 s grace, full deep sleep, only knob press wakes.
+  // SLEEP page (8): after 2s grace, full deep sleep, only knob press wakes.
   if (currentPage == 8 && millis() - pageEnterMs > MODE_ENTER_DELAY) {
     showMsg("FULL SLEEP", "Press knob to wake");
     delay(1500);
@@ -237,6 +214,7 @@ void loop() {
     lastRead = millis();
   }
   handleEncoder();
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
 
   display.clearDisplay();
   display.setCursor(0, 0);
@@ -255,7 +233,6 @@ void loop() {
     case 8: pageSleep(); break;
   }
 
-  // Page dots
   display.setCursor(0, 57);
   display.print("[");
   for (int i = 0; i < PAGES; i++)
@@ -265,7 +242,6 @@ void loop() {
   display.print(n[currentPage]);
   display.display();
 
-  // Auto-send
   if (transmitting && millis() - lastSend > SEND_INTERVAL) {
     if (txMode == 0 && wifiConnected) sendToSupabase();
     else if (txMode == 1 && loraOK) sendViaLoRa();
@@ -275,7 +251,6 @@ void loop() {
   delay(150);
 }
 
-// === SENSOR READS ===
 void readSensors() {
   if (bmpOK && bmp.performReading()) {
     temperature = bmp.temperature;
@@ -318,9 +293,6 @@ void readBattery() {
   isCharging = (battVoltage > 4.5);
 }
 
-// === ENCODER ===
-// Rotation = navigate pages. Same simple behavior as the original sketch.
-// Press handling (wake from sleep) is at the OS level via EXT0 wakeup.
 void handleEncoder() {
   if (encoderPos != lastEncPos) {
     int diff = encoderPos - lastEncPos;
@@ -339,7 +311,6 @@ bool buttonPressed() {
   return false;
 }
 
-// === PAGES ===
 void pageSensors() {
   display.println("=== SENSORS ===");
   display.print(temperature, 2); display.println(" C");
@@ -366,23 +337,18 @@ void pageSystem() {
   display.println("=== SYSTEM ===");
   display.print("Bat: "); display.print(battVoltage, 2);
   display.print("V "); display.print(battPercent); display.println("%");
+  display.print("Chrg: "); display.println(isCharging ? "YES (USB)" : "No");
   display.print("BMP: "); display.print(bmpOK ? "OK" : "ERR");
   display.print(" MPU: "); display.println(mpuOK ? "OK" : "ERR");
   display.print("LoRa: "); display.print(loraOK ? "OK" : "ERR");
   display.print(" WiFi: "); display.println(wifiConnected ? "OK" : "ERR");
-  const char* pgName[] = {"SENS","GPS","SYS","MODE","WIFI","TX","AWAKE","SEMI","SLEEP"};
-  display.print("Pg: "); display.print(pgName[currentPage]);
-  display.print(" Boot:"); display.println(bootCount);
 }
 
 void pageMode() {
   bool btn = buttonPressed();
   display.println("=== TX MODE ===");
   display.println();
-
-  if (btn) {
-    txMode = (txMode + 1) % 2;
-  }
+  if (btn) txMode = (txMode + 1) % 2;
 
   if (txMode == 0) {
     display.println("  > WiFi Direct");
@@ -407,16 +373,24 @@ void pageWifi() {
     display.println(WiFi.SSID());
     display.print("IP: "); display.println(WiFi.localIP());
     display.print("RSSI: "); display.print(WiFi.RSSI()); display.println("dB");
+    display.println();
+    display.println("Press to reset WiFi");
+    if (buttonPressed()) {
+      wifiManager.resetSettings();
+      showMsg("WiFi reset!", "Restarting...");
+      delay(1000);
+      ESP.restart();
+    }
   } else {
     display.println("Not connected");
+    display.println();
+    display.println("Press to start");
+    display.println("WiFi setup portal");
     if (buttonPressed()) {
-      showMsg("Reconnecting...", "");
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-      int t = 0;
-      while (WiFi.status() != WL_CONNECTED && t < 15) { delay(500); t++; }
+      showMsg("Connect phone to:", "\"Flood Finder\"");
+      wifiManager.startConfigPortal("Flood Finder");
       wifiConnected = (WiFi.status() == WL_CONNECTED);
     }
-    display.println("Press to reconnect");
   }
 }
 
@@ -430,7 +404,7 @@ void pageTransmit() {
     display.println("  STATUS: ACTIVE");
     display.print("  Via: ");
     display.println(txMode == 0 ? "WiFi" : "LoRa");
-    display.println("  Every 30 seconds");
+    display.println("  Every 10 seconds");
     display.print("  Last: ");
     display.print((millis()-lastSend)/1000); display.println("s ago");
     display.println("  Press to STOP");
@@ -442,7 +416,6 @@ void pageTransmit() {
   }
 }
 
-// === SEND VIA WIFI (Supabase POST) ===
 void sendToSupabase() {
   if (!wifiConnected) return;
 
@@ -478,13 +451,10 @@ void sendToSupabase() {
   http.end();
 }
 
-// === SEND VIA LORA ===
 void sendViaLoRa() {
   if (!loraOK) return;
 
-  // Pack sensor data into a compact LoRa packet
-  // Gateway receives this and forwards to Supabase via cellular
-  String pkt = "FF|";  // Flood Finder header
+  String pkt = "FF|";
   pkt += String(temperature, 2) + "|";
   pkt += String(pressure, 2) + "|";
   pkt += String(distance, 1) + "|";
@@ -505,10 +475,10 @@ void sendViaLoRa() {
 }
 
 // === POWER MODE PAGES ===
-// Three dedicated pages — rotating onto a sleep page activates that mode.
-// AWAKE page: normal sensor view, screen on, 10s read interval (default behavior).
-// SEMI page : 2s grace then sleeps 10min, wakes on timer, reads + sends, sleeps again.
-// SLEEP page: 2s grace then full deep sleep, only knob press wakes.
+// Three pages — rotating onto a sleep page activates that mode after 2s grace.
+//   AWAKE : normal sensor view, screen on, 10s read interval (default behavior).
+//   SEMI  : 2s grace then sleeps 10min, wakes on timer, reads + sends, sleeps again.
+//   SLEEP : 2s grace then full deep sleep, only knob press wakes.
 // Press knob from ANY sleep state -> wake to SENS page (page 0).
 void pageAwake() {
   display.println("=== AWAKE MODE ===");
@@ -552,14 +522,13 @@ void goToDeepSleep(int secs) {
   Serial.printf("[SLEEP] entering deep sleep for %d sec (button wake = AWAKE)\n", secs);
   Serial.flush();
 
-  // Shut everything down to minimize current draw
   display.clearDisplay();
   display.display();
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   LoRa.end();
 
-  // Configure encoder switch (GPIO 7) as wakeup source — wake when pulled LOW
+  // Encoder switch on GPIO 7 wakes the device (RTC-capable on ESP32-S3)
   rtc_gpio_pullup_en((gpio_num_t)ENC_SW);
   rtc_gpio_pulldown_dis((gpio_num_t)ENC_SW);
   esp_sleep_enable_ext0_wakeup((gpio_num_t)ENC_SW, 0);
@@ -571,7 +540,6 @@ void goToDeepSleep(int secs) {
   esp_deep_sleep_start();
 }
 
-// === HELPERS ===
 void showMsg(String line1, String line2) {
   display.clearDisplay();
   display.setCursor(0, 10);
