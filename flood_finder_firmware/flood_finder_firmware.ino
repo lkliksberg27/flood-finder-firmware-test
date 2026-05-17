@@ -13,8 +13,9 @@
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
 
-#define EXT_SDA   33
-#define EXT_SCL   34
+// === PIN DEFINITIONS (Heltec V4 carrier board, original layout) ===
+#define EXT_SDA   47
+#define EXT_SCL   48
 #define OLED_SDA  17
 #define OLED_SCL  18
 #define OLED_RST  21
@@ -24,10 +25,14 @@
 #define ENC_DT    6
 #define ENC_SW    7
 #define VBAT_PIN  1
-#define GPS_RX    46
-#define GPS_TX    45
+#define ADC_CTRL  37
+#define VEXT_PIN  36
+#define GPS_EN    34
+#define GPS_RX    39
+#define GPS_TX    38
 #define MPU6050_ADDR 0x68
 
+// Heltec V4 LoRa SX1262 pins
 #define LORA_SS    8
 #define LORA_RST   12
 #define LORA_DIO1  14
@@ -46,26 +51,18 @@ WiFiManager wifiManager;
 volatile int encoderPos = 0;
 int lastEncPos = 0;
 int currentPage = 0;
-// Pages 0..5 = original. Pages 6,7,8 = AWAKE / SEMI / SLEEP power mode pages.
-// Rotation onto a sleep page activates that mode after a 2-second grace.
-const int PAGES = 9;
+const int PAGES = 9;  // 0..5 original + 6=AWAKE, 7=SEMI, 8=SLEEP
 bool bmpOK = false, mpuOK = false, wifiConnected = false, loraOK = false;
 bool transmitting = false;
 bool isCharging = false;
 int txMode = 0;
 unsigned long lastSend = 0;
-unsigned long lastRead = 0;
 unsigned long lastBtn = 0;
-const unsigned long SEND_INTERVAL = 10000;   // 10s (was 30s)
-const unsigned long READ_INTERVAL = 10000;   // 10s reads in AWAKE mode
+const unsigned long SEND_INTERVAL = 30000;
 
-// Power mode state (persisted through deep sleep via RTC memory)
-RTC_DATA_ATTR int bootCount = 0;
-RTC_DATA_ATTR int rtcSleepPage = -1;          // Page we slept from; -1 = wasn't sleeping
-const unsigned long SEMI_SLEEP_SEC = 600;     // 10 min between SEMI-sleep reads
-const unsigned long MODE_ENTER_DELAY = 2000;  // 2s grace before a sleep page actually sleeps
-
-unsigned long pageEnterMs = 0;
+// Sleep state persists across deep sleep
+RTC_DATA_ATTR int rtcSleepPage = -1;
+const unsigned long SEMI_SLEEP_SEC = 600;  // 10 min between SEMI reads
 
 float temperature, pressure, distance, tiltAngle;
 int16_t ax, ay, az;
@@ -82,35 +79,37 @@ void IRAM_ATTR encoderISR() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  bootCount++;
 
   // Wake-cause routing:
   //   EXT0 (encoder press) -> force AWAKE, land on SENS page
   //   TIMER (from SEMI sleep) -> resume SEMI page, take one reading, sleep again
   esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
   if (wake == ESP_SLEEP_WAKEUP_EXT0) {
-    Serial.println("[WAKE] Encoder button -> AWAKE page");
     currentPage = 0;
     rtcSleepPage = -1;
   } else if (wake == ESP_SLEEP_WAKEUP_TIMER) {
-    Serial.println("[WAKE] Timer -> resume SEMI page");
     currentPage = (rtcSleepPage >= 0) ? rtcSleepPage : 7;
   }
 
+  // OLED — full brightness
   pinMode(OLED_RST, OUTPUT);
   digitalWrite(OLED_RST, LOW); delay(50);
   digitalWrite(OLED_RST, HIGH); delay(50);
   Wire1.begin(OLED_SDA, OLED_SCL);
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  if (wake == ESP_SLEEP_WAKEUP_TIMER) {
-    showMsg("Semi-sleep wake", "Reading sensors...");
-  } else if (wake == ESP_SLEEP_WAKEUP_EXT0) {
-    showMsg("WOKE UP", "Mode: AWAKE");
-  } else {
-    showMsg("FLOOD FINDER v2", "Booting...");
-  }
+  display.ssd1306_command(SSD1306_SETCONTRAST);
+  display.ssd1306_command(0xFF);  // max contrast
+  display.dim(false);
+  showMsg("FLOOD FINDER v2", "Booting...");
 
+  // Sensor I2C
   Wire.begin(EXT_SDA, EXT_SCL);
+
+  // Vext + GPS + ADC power control (V4 carrier internal)
+  pinMode(VEXT_PIN, OUTPUT);  digitalWrite(VEXT_PIN, LOW);     // enable peripherals
+  pinMode(GPS_EN, OUTPUT);    digitalWrite(GPS_EN, LOW);       // enable L76K GPS
+  pinMode(ADC_CTRL, OUTPUT);  digitalWrite(ADC_CTRL, HIGH);    // enable battery divider
+
   GPSSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
 
   pinMode(TRIG_PIN, OUTPUT);
@@ -152,30 +151,20 @@ void setup() {
           " LoRa:" + String(loraOK?"OK":"FAIL"));
   delay(1500);
 
-  // WiFiManager — creates "Flood Finder" hotspot if no saved WiFi.
-  // Connect from your phone, captive portal lets you pick a network.
-  showMsg("WiFi Setup", "Connect phone to:");
-  display.println("\"Flood Finder\"");
-  display.println("to configure WiFi");
-  display.display();
-
+  // WiFiManager portal — phone connects to "Flood Finder" hotspot to set up WiFi
+  showMsg("WiFi Setup", "Phone -> Flood Finder");
   wifiManager.setConfigPortalTimeout(120);
   wifiManager.setAPCallback([](WiFiManager *mgr) {
     showMsg("Connect phone to:", "\"Flood Finder\"");
   });
-
   wifiConnected = wifiManager.autoConnect("Flood Finder");
-
   if (wifiConnected) showMsg("WiFi Connected!", WiFi.localIP().toString());
   else showMsg("WiFi skipped", "LoRa mode available");
   delay(1500);
 
-  // If we woke from the SEMI-sleep timer, do one reading + send and go back to sleep.
-  // (loop() never runs in this path.)
+  // Timer wake from SEMI mode: read once, send, sleep again. loop() never runs here.
   if (wake == ESP_SLEEP_WAKEUP_TIMER) {
-    readSensors();
-    readGPS();
-    readBattery();
+    readSensors(); readGPS(); readBattery();
     if (txMode == 0 && wifiConnected) sendToSupabase();
     else if (txMode == 1 && loraOK) sendViaLoRa();
     showMsg("Semi-sleep", "Back to sleep...");
@@ -183,38 +172,13 @@ void setup() {
     rtcSleepPage = 7;
     goToDeepSleep(SEMI_SLEEP_SEC);
   }
-  pageEnterMs = millis();
 }
 
 void loop() {
-  // SEMI page (7): after 2s grace, take one reading + send, deep sleep 10 min.
-  // Timer wake comes back through setup() to repeat.
-  if (currentPage == 7 && millis() - pageEnterMs > MODE_ENTER_DELAY) {
-    readSensors(); readGPS(); readBattery();
-    if (txMode == 0 && wifiConnected) sendToSupabase();
-    else if (txMode == 1 && loraOK) sendViaLoRa();
-    showMsg("SEMI SLEEP", "Sleep 10 min...");
-    delay(1500);
-    rtcSleepPage = 7;
-    goToDeepSleep(SEMI_SLEEP_SEC);
-  }
-  // SLEEP page (8): after 2s grace, full deep sleep, only knob press wakes.
-  if (currentPage == 8 && millis() - pageEnterMs > MODE_ENTER_DELAY) {
-    showMsg("FULL SLEEP", "Press knob to wake");
-    delay(1500);
-    rtcSleepPage = 8;
-    goToDeepSleep(0);
-  }
-
-  // AWAKE: throttle sensor reads to once every READ_INTERVAL (10s)
-  if (millis() - lastRead > READ_INTERVAL || lastRead == 0) {
-    readSensors();
-    readGPS();
-    readBattery();
-    lastRead = millis();
-  }
+  readSensors();
+  readGPS();
+  readBattery();
   handleEncoder();
-  wifiConnected = (WiFi.status() == WL_CONNECTED);
 
   display.clearDisplay();
   display.setCursor(0, 0);
@@ -251,6 +215,7 @@ void loop() {
   delay(150);
 }
 
+// === SENSOR READS ===
 void readSensors() {
   if (bmpOK && bmp.performReading()) {
     temperature = bmp.temperature;
@@ -298,9 +263,7 @@ void readBattery() {
 void handleEncoder() {
   if (encoderPos != lastEncPos) {
     int diff = encoderPos - lastEncPos;
-    int prevPage = currentPage;
     currentPage = (currentPage + diff + PAGES) % PAGES;
-    if (currentPage != prevPage) pageEnterMs = millis();
     lastEncPos = encoderPos;
   }
 }
@@ -313,6 +276,7 @@ bool buttonPressed() {
   return false;
 }
 
+// === PAGES ===
 void pageSensors() {
   display.println("=== SENSORS ===");
   display.print(temperature, 2); display.println(" C");
@@ -406,7 +370,7 @@ void pageTransmit() {
     display.println("  STATUS: ACTIVE");
     display.print("  Via: ");
     display.println(txMode == 0 ? "WiFi" : "LoRa");
-    display.println("  Every 10 seconds");
+    display.println("  Every 30 seconds");
     display.print("  Last: ");
     display.print((millis()-lastSend)/1000); display.println("s ago");
     display.println("  Press to STOP");
@@ -476,61 +440,60 @@ void sendViaLoRa() {
   Serial.println(pkt);
 }
 
-// === POWER MODE PAGES ===
-// Three pages — rotating onto a sleep page activates that mode after 2s grace.
-//   AWAKE : normal sensor view, screen on, 10s read interval (default behavior).
-//   SEMI  : 2s grace then sleeps 10min, wakes on timer, reads + sends, sleeps again.
-//   SLEEP : 2s grace then full deep sleep, only knob press wakes.
-// Press knob from ANY sleep state -> wake to SENS page (page 0).
+// === SLEEP PAGES ===
+// Rotate onto a sleep page -> see the description. Press the encoder to confirm.
+// Nothing happens automatically — you have to press to actually sleep.
+// Pressing the encoder during deep sleep wakes the device back to SENS.
 void pageAwake() {
   display.println("=== AWAKE MODE ===");
   display.println();
   display.println("  Always on");
-  display.println("  Reads every 10s");
   display.println("  Screen stays on");
   display.println();
-  display.println("(turn to leave)");
+  display.println("(default, no press)");
 }
 
 void pageSemi() {
   display.println("=== SEMI SLEEP ===");
+  display.println("  Sleep 10 min");
+  display.println("  Wake -> 1 reading");
+  display.println("  Send + sleep again");
   display.println();
-  display.println("  Sleeps 10 min");
-  display.println("  Wakes for 1 reading");
-  display.println("  Sends + sleeps again");
-  int rem = (MODE_ENTER_DELAY - (millis() - pageEnterMs) + 999) / 1000;
-  if (rem < 0) rem = 0;
-  display.print("Entering in ");
-  display.print(rem);
-  display.println("s...");
+  display.println("  PRESS TO CONFIRM");
+  if (buttonPressed()) {
+    readSensors(); readGPS(); readBattery();
+    if (txMode == 0 && wifiConnected) sendToSupabase();
+    else if (txMode == 1 && loraOK) sendViaLoRa();
+    showMsg("SEMI SLEEP", "Sleep 10 min...");
+    delay(1200);
+    rtcSleepPage = 7;
+    goToDeepSleep(SEMI_SLEEP_SEC);
+  }
 }
 
 void pageSleep() {
   display.println("=== FULL SLEEP ===");
-  display.println();
   display.println("  Everything OFF");
-  display.println("  Press knob to wake");
+  display.println("  Only knob wakes");
   display.println();
-  int rem = (MODE_ENTER_DELAY - (millis() - pageEnterMs) + 999) / 1000;
-  if (rem < 0) rem = 0;
-  display.print("Entering in ");
-  display.print(rem);
-  display.println("s...");
+  display.println();
+  display.println("  PRESS TO CONFIRM");
+  if (buttonPressed()) {
+    showMsg("FULL SLEEP", "Press knob to wake");
+    delay(1200);
+    rtcSleepPage = 8;
+    goToDeepSleep(0);
+  }
 }
 
-// === DEEP SLEEP HELPER ===
 // secs > 0: wake on timer OR encoder press. secs == 0: only encoder press wakes.
 void goToDeepSleep(int secs) {
-  Serial.printf("[SLEEP] entering deep sleep for %d sec (button wake = AWAKE)\n", secs);
-  Serial.flush();
-
   display.clearDisplay();
   display.display();
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   LoRa.end();
 
-  // Encoder switch on GPIO 7 wakes the device (RTC-capable on ESP32-S3)
   rtc_gpio_pullup_en((gpio_num_t)ENC_SW);
   rtc_gpio_pulldown_dis((gpio_num_t)ENC_SW);
   esp_sleep_enable_ext0_wakeup((gpio_num_t)ENC_SW, 0);
@@ -538,7 +501,6 @@ void goToDeepSleep(int secs) {
   if (secs > 0) {
     esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
   }
-
   esp_deep_sleep_start();
 }
 
