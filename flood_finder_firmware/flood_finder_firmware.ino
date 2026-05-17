@@ -327,19 +327,42 @@ void takeAveragedReadings() {
   sortF(tArr, N); sortF(pArr, N); sortF(dArr, N); sortF(aArr, N);
   sortI(axArr, N); sortI(ayArr, N); sortI(azArr, N);
 
-  float sT=0, sP=0, sD=0, sA=0;
-  int32_t sX=0, sY=0, sZ=0;
-  for (int i = TRIM; i < N - TRIM; i++) {
-    sT += tArr[i]; sP += pArr[i]; sD += dArr[i]; sA += aArr[i];
-    sX += axArr[i]; sY += ayArr[i]; sZ += azArr[i];
-  }
-  temperature = sT / KEEP;
-  pressure    = sP / KEEP;
-  distance    = sD / KEEP;
-  tiltAngle   = sA / KEEP;
-  ax = sX / KEEP;
-  ay = sY / KEEP;
-  az = sZ / KEEP;
+  // Of the middle KEEP samples: if fewer than 6 are exactly zero, those zeros
+  // are glitches (especially common on the JSN-SR04T ultrasonic) — drop them
+  // and average the rest. If 6+ are zero, the sensor really is reading zero,
+  // so include them in the average.
+  auto zeroTrimF = [](float* a, int n) -> float {
+    int zeros = 0;
+    for (int i = 0; i < n; i++) if (a[i] == 0.0f) zeros++;
+    if (zeros > 0 && zeros < 6 && zeros < n) {
+      float s = 0;
+      for (int i = 0; i < n; i++) if (a[i] != 0.0f) s += a[i];
+      return s / (n - zeros);
+    }
+    float s = 0;
+    for (int i = 0; i < n; i++) s += a[i];
+    return s / n;
+  };
+  auto zeroTrimI = [](int32_t* a, int n) -> int32_t {
+    int zeros = 0;
+    for (int i = 0; i < n; i++) if (a[i] == 0) zeros++;
+    if (zeros > 0 && zeros < 6 && zeros < n) {
+      int32_t s = 0;
+      for (int i = 0; i < n; i++) if (a[i] != 0) s += a[i];
+      return s / (n - zeros);
+    }
+    int32_t s = 0;
+    for (int i = 0; i < n; i++) s += a[i];
+    return s / n;
+  };
+
+  temperature = zeroTrimF(tArr + TRIM, KEEP);
+  pressure    = zeroTrimF(pArr + TRIM, KEEP);
+  distance    = zeroTrimF(dArr + TRIM, KEEP);
+  tiltAngle   = zeroTrimF(aArr + TRIM, KEEP);
+  ax = (int16_t)zeroTrimI(axArr + TRIM, KEEP);
+  ay = (int16_t)zeroTrimI(ayArr + TRIM, KEEP);
+  az = (int16_t)zeroTrimI(azArr + TRIM, KEEP);
 }
 
 void handleEncoder() {
