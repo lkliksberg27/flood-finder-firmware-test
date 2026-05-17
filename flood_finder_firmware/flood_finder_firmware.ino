@@ -186,7 +186,8 @@ void setup() {
 
   // Timer wake from SEMI mode: read once, send, sleep again. loop() never runs here.
   if (wake == ESP_SLEEP_WAKEUP_TIMER) {
-    readSensors(); readGPS(); readBattery();
+    readGPS(); readBattery();
+    takeAveragedReadings();   // 20-sample trimmed mean (same as awake-mode TX)
     if (txMode == 0 && wifiConnected) sendToSupabase();
     else if (txMode == 1 && loraOK) sendViaLoRa();
     showMsg("Semi-sleep", "Back to sleep...");
@@ -230,6 +231,7 @@ void loop() {
   display.display();
 
   if (transmitting && millis() - lastSend > SEND_INTERVAL) {
+    takeAveragedReadings();   // 20-sample trimmed mean before TX
     if (txMode == 0 && wifiConnected) sendToSupabase();
     else if (txMode == 1 && loraOK) sendViaLoRa();
     lastSend = millis();
@@ -281,6 +283,63 @@ void readBattery() {
   battVoltage = (v_adc_mV / 1000.0) * 4.9;
   battPercent = constrain((int)((battVoltage - 3.0) / (4.2 - 3.0) * 100), 0, 100);
   isCharging = (battVoltage > 4.5);
+}
+
+// Take 20 fast samples, sort each sensor's array, drop top/bottom 4 (20%),
+// average the middle 12, write the result into the globals so the next send
+// transmits a clean, outlier-resistant value. ~400 ms blocking.
+void takeAveragedReadings() {
+  const int N = 20;
+  const int TRIM = 4;       // 20% of N
+  const int KEEP = N - 2 * TRIM;
+
+  float tArr[N], pArr[N], dArr[N], aArr[N];
+  int32_t axArr[N], ayArr[N], azArr[N];
+
+  for (int i = 0; i < N; i++) {
+    readSensors();
+    tArr[i]  = temperature;
+    pArr[i]  = pressure;
+    dArr[i]  = distance;
+    aArr[i]  = tiltAngle;
+    axArr[i] = ax;
+    ayArr[i] = ay;
+    azArr[i] = az;
+    delay(15);
+  }
+
+  // tiny insertion sort — fine for N=20
+  auto sortF = [](float* a, int n) {
+    for (int i = 1; i < n; i++) {
+      float k = a[i]; int j = i - 1;
+      while (j >= 0 && a[j] > k) { a[j+1] = a[j]; j--; }
+      a[j+1] = k;
+    }
+  };
+  auto sortI = [](int32_t* a, int n) {
+    for (int i = 1; i < n; i++) {
+      int32_t k = a[i]; int j = i - 1;
+      while (j >= 0 && a[j] > k) { a[j+1] = a[j]; j--; }
+      a[j+1] = k;
+    }
+  };
+
+  sortF(tArr, N); sortF(pArr, N); sortF(dArr, N); sortF(aArr, N);
+  sortI(axArr, N); sortI(ayArr, N); sortI(azArr, N);
+
+  float sT=0, sP=0, sD=0, sA=0;
+  int32_t sX=0, sY=0, sZ=0;
+  for (int i = TRIM; i < N - TRIM; i++) {
+    sT += tArr[i]; sP += pArr[i]; sD += dArr[i]; sA += aArr[i];
+    sX += axArr[i]; sY += ayArr[i]; sZ += azArr[i];
+  }
+  temperature = sT / KEEP;
+  pressure    = sP / KEEP;
+  distance    = sD / KEEP;
+  tiltAngle   = sA / KEEP;
+  ax = sX / KEEP;
+  ay = sY / KEEP;
+  az = sZ / KEEP;
 }
 
 void handleEncoder() {
@@ -527,7 +586,8 @@ void pageSemi() {
   display.println();
   display.println("  PRESS TO CONFIRM");
   if (buttonPressed()) {
-    readSensors(); readGPS(); readBattery();
+    readGPS(); readBattery();
+    takeAveragedReadings();   // 20-sample trimmed mean before the first send
     if (txMode == 0 && wifiConnected) sendToSupabase();
     else if (txMode == 1 && loraOK) sendViaLoRa();
     showMsg("SEMI SLEEP", "Sleep 10 min...");
