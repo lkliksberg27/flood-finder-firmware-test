@@ -195,13 +195,30 @@ void setup() {
     rtcSleepPage = 8;
     goToDeepSleep(SEMI_SLEEP_SEC);
   }
+
+  // Initial reading so the first SENS render has real values (loop() won't
+  // take its next burst until SEND_INTERVAL ms have passed).
+  readBattery();
+  takeAveragedReadings();
 }
 
 void loop() {
-  readSensors();
-  readGPS();
-  readBattery();
-  handleEncoder();
+  readGPS();          // must run every loop — drains the GPS NMEA serial buffer
+  handleEncoder();    // must run every loop for responsive input
+
+  // Every SEND_INTERVAL ms: take a fresh 20-sample burst (this updates the
+  // sensor globals that all the pages read). If transmit is on, send too.
+  static unsigned long lastSampleMs = 0;
+  if (millis() - lastSampleMs > SEND_INTERVAL) {
+    takeAveragedReadings();
+    readBattery();
+    lastSampleMs = millis();
+    if (transmitting) {
+      if (txMode == 0 && wifiConnected) sendToSupabase();
+      else if (txMode == 1 && loraOK) sendViaLoRa();
+      lastSend = millis();
+    }
+  }
 
   display.clearDisplay();
   display.setCursor(0, 0);
@@ -230,14 +247,7 @@ void loop() {
   display.print(n[currentPage]);
   display.display();
 
-  if (transmitting && millis() - lastSend > SEND_INTERVAL) {
-    takeAveragedReadings();   // 20-sample trimmed mean before TX
-    if (txMode == 0 && wifiConnected) sendToSupabase();
-    else if (txMode == 1 && loraOK) sendViaLoRa();
-    lastSend = millis();
-  }
-
-  delay(30);  // was 150ms — much snappier encoder response
+  delay(30);
 }
 
 // === SENSOR READS ===
