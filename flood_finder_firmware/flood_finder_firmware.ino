@@ -206,12 +206,19 @@ void loop() {
   readGPS();          // must run every loop — drains the GPS NMEA serial buffer
   handleEncoder();    // must run every loop for responsive input
 
-  // Every SEND_INTERVAL ms: take a fresh 20-sample burst (this updates the
-  // sensor globals that all the pages read). If transmit is on, send too.
+  // Once a second: single cheap reading so the SENS page shows fresh values.
+  static unsigned long lastReadMs = 0;
+  if (millis() - lastReadMs > 1000) {
+    readSensors();
+    readBattery();
+    lastReadMs = millis();
+  }
+
+  // Every SEND_INTERVAL ms (10s): 20-sample averaged burst. This overwrites
+  // the globals with a clean trimmed mean and (if transmit on) sends it.
   static unsigned long lastSampleMs = 0;
   if (millis() - lastSampleMs > SEND_INTERVAL) {
     takeAveragedReadings();
-    readBattery();
     lastSampleMs = millis();
     if (transmitting) {
       if (txMode == 0 && wifiConnected) sendToSupabase();
